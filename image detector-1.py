@@ -3,7 +3,7 @@ import numpy as np
 import os
 import shutil
 from tqdm import tqdm  # For progress bar
-
+import gc  # For garbage collection
 
 def preprocess_image(image):
     """
@@ -12,28 +12,21 @@ def preprocess_image(image):
     blurred_image = cv2.GaussianBlur(image, (5, 5), 0)
     return blurred_image
 
-
 def extract_dominant_colors(image, k=5, top_n=3):
     """
     Extract the top N dominant colors of an image using K-means clustering in LAB color space.
     """
-    # Convert the image to LAB color space
     lab_image = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-
-    # Reshape the image data into a 2D array of pixels
     data = lab_image.reshape((-1, 3))
     data = np.float32(data)
 
-    # Apply K-means clustering
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
     _, labels, centers = cv2.kmeans(data, k, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
 
-    # Get the top N most dominant colors
     unique, counts = np.unique(labels, return_counts=True)
     sorted_indices = np.argsort(-counts)
     dominant_colors = centers[sorted_indices][:top_n]
     return dominant_colors
-
 
 def calculate_histogram(image):
     """
@@ -44,13 +37,11 @@ def calculate_histogram(image):
     cv2.normalize(hist, hist)
     return hist
 
-
 def histogram_similarity(hist1, hist2):
     """
     Compare two histograms using correlation.
     """
     return cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
-
 
 def color_distance(color1, color2):
     """
@@ -58,22 +49,70 @@ def color_distance(color1, color2):
     """
     return np.linalg.norm(color1 - color2)
 
-
 def scan_images(input_folder):
     """
-    Scan the input folder for valid image files.
+    Scan the input folder for valid image files and evaluate them.
     """
-    files = [file for file in os.listdir(input_folder) if file.endswith(('.jpg', '.jpeg', '.png'))]
+    files = [os.path.join(input_folder, file) for file in os.listdir(input_folder) if file.endswith(('.jpg', '.jpeg', '.png'))]
     valid_images = []
-    for file in tqdm(files, desc="Scanning Images"):
-        filepath = os.path.join(input_folder, file)
+    for filepath in tqdm(files, desc="Scanning Images"):
         image = cv2.imread(filepath)
         if image is not None:
             valid_images.append(filepath)
         else:
-            print(f"Invalid image file skipped: {file}")
+            print(f"Invalid image file skipped: {os.path.basename(filepath)}")
     return valid_images
 
+def process_image(filepath, color_groups, histogram_groups, group_folders, output_folder, k, top_n, threshold, hist_threshold):
+    """
+    Process a single image and group it.
+    """
+    file = os.path.basename(filepath)
+    image = cv2.imread(filepath)
+
+    if image is None:
+        print(f"Error reading image: {file}")
+        return
+
+    # Preprocess the image
+    preprocessed_image = preprocess_image(image)
+
+    # Extract dominant colors
+    dominant_colors = extract_dominant_colors(preprocessed_image, k, top_n)
+
+    # Calculate histogram
+    hist = calculate_histogram(preprocessed_image)
+
+    # Check if the image matches any existing group
+    group_found = False
+    for idx, color_group in enumerate(color_groups):
+        # Check color similarity
+        color_similarities = [color_distance(dominant_color, group_color) for dominant_color, group_color in zip(dominant_colors, color_group)]
+        avg_color_similarity = sum(color_similarities) / len(color_similarities)
+
+        # Check histogram similarity
+        hist_similarity = histogram_similarity(hist, histogram_groups[idx])
+
+        if avg_color_similarity < threshold and hist_similarity > hist_threshold:
+            shutil.move(filepath, os.path.join(group_folders[idx], file))
+            group_found = True
+            break
+
+    # If no group matches, create a new one
+    if not group_found:
+        new_group_folder = os.path.join(output_folder, f"group_{len(color_groups)+1}")
+        if not os.path.exists(new_group_folder):  # Ensure the folder does not already exist
+            os.makedirs(new_group_folder)
+        shutil.move(filepath, os.path.join(new_group_folder, file))
+
+        # Save the dominant colors and histogram for the new group
+        color_groups.append(dominant_colors)
+        histogram_groups.append(hist)
+        group_folders.append(new_group_folder)
+
+    # Explicitly free memory
+    del image, preprocessed_image, dominant_colors, hist
+    gc.collect()
 
 def sort_images_by_color(input_folder, output_folder, k=5, top_n=3, threshold=50.0, hist_threshold=0.7):
     """
@@ -95,44 +134,7 @@ def sort_images_by_color(input_folder, output_folder, k=5, top_n=3, threshold=50
 
     # Use tqdm to create a progress bar
     for filepath in tqdm(valid_images, desc="Processing Images"):
-        file = os.path.basename(filepath)
-        image = cv2.imread(filepath)
-
-        # Preprocess the image
-        preprocessed_image = preprocess_image(image)
-
-        # Extract dominant colors
-        dominant_colors = extract_dominant_colors(preprocessed_image, k, top_n)
-
-        # Calculate histogram
-        hist = calculate_histogram(preprocessed_image)
-
-        # Check if the image matches any existing group
-        group_found = False
-        for idx, color_group in enumerate(color_groups):
-            # Check color similarity
-            color_similarities = [color_distance(dominant_color, group_color) for dominant_color, group_color in zip(dominant_colors, color_group)]
-            avg_color_similarity = sum(color_similarities) / len(color_similarities)
-
-            # Check histogram similarity
-            hist_similarity = histogram_similarity(hist, histogram_groups[idx])
-
-            if avg_color_similarity < threshold and hist_similarity > hist_threshold:
-                shutil.move(filepath, os.path.join(group_folders[idx], file))
-                group_found = True
-                break
-
-        # If no group matches, create a new one
-        if not group_found:
-            new_group_folder = os.path.join(output_folder, f"group_{len(color_groups)+1}")
-            if not os.path.exists(new_group_folder):  # Ensure the folder does not already exist
-                os.makedirs(new_group_folder)
-            shutil.move(filepath, os.path.join(new_group_folder, file))
-
-            # Save the dominant colors and histogram for the new group
-            color_groups.append(dominant_colors)
-            histogram_groups.append(hist)
-            group_folders.append(new_group_folder)
+        process_image(filepath, color_groups, histogram_groups, group_folders, output_folder, k, top_n, threshold, hist_threshold)
 
     print("Images sorted successfully!")
 
